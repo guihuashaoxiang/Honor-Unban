@@ -12,13 +12,30 @@ from paddleocr import PaddleOCR
 # 引入转换所需的库
 import numpy as np
 import cv2
+
+# ============================ 【核心修改部分：动态路径配置】 ============================
+# 1. 生成唯一的运行时间戳，用于命名日志文件和截图文件夹
+RUN_TIMESTAMP = time.strftime('%Y%m%d_%H%M%S')
+
+# 2. 配置日志目录和文件
+LOG_DIR = "logs"
+if not os.path.exists(LOG_DIR): os.makedirs(LOG_DIR)
+LOG_FILE_PATH = os.path.join(LOG_DIR, f"{RUN_TIMESTAMP}.log")
+
+# 3. 配置截图目录，为本次运行创建一个独立的子文件夹
+SCREENSHOT_BASE_DIR = "screenshots"
+SCREENSHOT_RUN_DIR = os.path.join(SCREENSHOT_BASE_DIR, RUN_TIMESTAMP)
+if not os.path.exists(SCREENSHOT_RUN_DIR): os.makedirs(SCREENSHOT_RUN_DIR)
+# ============================ 【修改结束】 ============================
+
+
 # ==================== 日志配置 START ====================
-# (日志部分保持不变)
+# (日志部分保持不变, 但使用新的动态文件路径)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    log_file = 'auto_solver.log'
-    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    # 使用动态生成的日志文件路径
+    file_handler = logging.FileHandler(LOG_FILE_PATH, mode='w', encoding='utf-8')
     console_handler = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
@@ -32,11 +49,6 @@ if not logger.handlers:
 # ==============================================================================
 # ------------------- 区域与核心配置 (必须修改) -------------------
 SCREEN_REGION = (2481, 0, 901, 2063)
-
-# 【新增配置】滚动模式，用于兼容不同平台的滚动方式
-# 'MOBILE_DRAG': 仅使用拖拽滚动，适用于手机投屏。
-# 'PC_WHEEL'   : 仅使用鼠标滚轮滚动，适用于电脑版微信小程序等PC应用。
-# 'BOTH'       : (默认) 先执行拖拽滚动，再执行滚轮滚动，以最大程度保证兼容性。
 SCROLL_MODE = 'BOTH'
 
 # ------------------- 速度与延时控制 (可按需微调) -------------------
@@ -50,9 +62,6 @@ MAX_MULTI_CHOICE_ATTEMPTS = 3
 MAX_SCROLL_ATTEMPTS = 3
 
 # ------------------- 资源与模型定义 (一般无需修改) -------------------
-# ... (此部分保持不变) ...
-SCREENSHOT_DIR = "screenshots"
-if not os.path.exists(SCREENSHOT_DIR): os.makedirs(SCREENSHOT_DIR)
 TEMPLATES_DIR = "templates"
 if not os.path.exists(TEMPLATES_DIR): 
     os.makedirs(TEMPLATES_DIR)
@@ -89,17 +98,19 @@ try:
 except Exception as e:
     logger.error(f"OCR模型初始化失败: {e}"); exit()
 logger.info(f"=========== 配置加载 ===========")
+logger.info(f"日志文件将保存至: {LOG_FILE_PATH}")
+logger.info(f"本次运行截图将保存至: {SCREENSHOT_RUN_DIR}")
 logger.info(f"投屏区域 (Region): {SCREEN_REGION}")
-logger.info(f"滚动模式 (Scroll Mode): {SCROLL_MODE}") # 新增日志
-logger.info(f"滚动后延时 (Scroll Delay): {POST_SCROLL_DELAY}s")
-logger.info(f"最大滚动次数 (Scroll Retries): {MAX_SCROLL_ATTEMPTS}")
-# ... (其余打印语句保持不变) ...
+logger.info(f"滚动模式 (Scroll Mode): {SCROLL_MODE}")
 
 # --- 桌面操作核心函数 ---
 def capture_region(filename=None):
     pil_img = pyautogui.screenshot(region=SCREEN_REGION)
     if filename:
+        # 确保目录存在，避免因延迟创建而出错
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         pil_img.save(filename)
+        logger.info(f"截图已保存至: {filename}")
     np_array = np.array(pil_img)
     opencv_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
     return opencv_img
@@ -111,11 +122,7 @@ def click_at_region_pos(region_pos):
     logger.info(f"执行点击: 区域坐标={region_pos}, 屏幕绝对坐标=({absolute_x}, {absolute_y})")
     pyautogui.click(absolute_x, absolute_y)
 
-# ============================ 【核心修改部分：滚动逻辑】 ============================
 def _scroll_with_drag():
-    """
-    内部函数：执行拖拽滚动（适用于手机投屏）。
-    """
     logger.info("执行[拖动滚动] (适用于手机投屏)...")
     region_x, region_y, region_w, region_h = SCREEN_REGION
     drag_center_x = region_x + region_w // 2
@@ -128,48 +135,35 @@ def _scroll_with_drag():
     logger.info("拖动滚动完成。")
 
 def _scroll_with_wheel():
-    """
-    内部函数：执行鼠标滚轮滚动（适用于PC原生应用）。
-    """
     logger.info("执行[PC滚轮滚动] (适用于电脑应用)...")
     region_x, region_y, region_w, region_h = SCREEN_REGION
-    # 将鼠标移动到区域中心，确保滚动作用于正确窗口
     center_x = region_x + region_w // 2
     center_y = region_y + region_h // 2
     pyautogui.moveTo(center_x, center_y, duration=0.2)
-    # 执行向下滚动，负值表示向下滚动，数值大小表示滚动幅度
     pyautogui.scroll(-500) 
     logger.info("PC滚轮滚动完成。")
 
 def scroll_in_region():
-    """
-    【重构】滚动分发函数。根据 SCROLL_MODE 配置调用不同的滚动方法。
-    这是对外暴露的唯一滚动接口。
-    """
     logger.info(f"根据配置 [{SCROLL_MODE}] 执行滚动操作...")
-    
     if SCROLL_MODE == 'MOBILE_DRAG':
         _scroll_with_drag()
     elif SCROLL_MODE == 'PC_WHEEL':
         _scroll_with_wheel()
     elif SCROLL_MODE == 'BOTH':
-        # 在'BOTH'模式下，两种滚动方式都会执行，以提高成功率
-        logger.info("-> 模式'BOTH': 先执行[拖动滚动]，再执行[PC滚轮滚动]。")
         _scroll_with_drag()
-        time.sleep(0.3) # 在两种滚动之间短暂暂停，避免操作过快
+        time.sleep(0.3)
         _scroll_with_wheel()
     else:
         logger.warning(f"未知的 SCROLL_MODE: '{SCROLL_MODE}'。将执行默认的拖动滚动。")
         _scroll_with_drag()
-# ============================ 【修改结束】 ============================
-    
+
 # --- 逻辑函数 ---
 def get_screen_info():
-    # ... (此函数无需修改) ...
-    screen_path = os.path.join(SCREENSHOT_DIR, "temp_screen.png")
-    capture_region(filename=screen_path)
+    # 此函数现在只用于OCR识别，不再负责保存截图
+    screen_img = capture_region() # 不传递filename参数
     try:
-        result = ocr.ocr(screen_path, cls=True)
+        # 直接对内存中的图像进行OCR，提高效率
+        result = ocr.ocr(screen_img, cls=True)
         if not result or not result[0]: return None, "单选题"
         full_text = " ".join([line[1][0] for line in result[0]])
         match = re.search(r'第(\d+|[一二三四五六七八九十百]+)题', full_text)
@@ -179,41 +173,60 @@ def get_screen_info():
     except Exception:
         return None, "单选题"
 
-def find_submit_button_with_scroll():
+# ============================ 【核心修改部分：截图逻辑】 ============================
+def find_submit_button_with_scroll(q_num, screenshot_dir):
     """
-    查找提交按钮，如果找不到，会循环滚动屏幕最多 MAX_SCROLL_ATTEMPTS 次。
-    【无需修改】此函数调用了新的 scroll_in_region() 分发器，自动适配滚动模式。
+    【已重构】查找提交按钮，并根据过程自动保存截图。
+    - 开始时，立即截取并保存第一张图 (e.g., 第1题_1.png)。
+    - 如果需要滚动，在找到按钮后，截取并保存第二张图 (e.g., 第1题_2.png)。
+
+    Args:
+        q_num (str): 当前题号，用于命名截图。
+        screenshot_dir (str): 本次运行的截图保存目录。
+
+    Returns:
+        tuple: (submit_pos, scrolled)
     """
-    # 步骤 1: 在当前屏幕直接查找，不滚动
-    screen_img = capture_region()
+    # 步骤0: 清理题号，使其成为合法的文件名
+    safe_q_num = re.sub(r'[\\/*?:"<>|]', "_", q_num)
+
+    # 步骤 1: 截取并保存初始屏幕截图 (第一张)
+    screenshot_path_1 = os.path.join(screenshot_dir, f"{safe_q_num}_1.png")
+    screen_img = capture_region(filename=screenshot_path_1)
     submit_pos = TEMPLATE_SUBMIT.match_in(screen_img)
+
     if submit_pos:
-        logger.info(f"在当前页面找到[提交按钮]，区域坐标: {submit_pos}")
+        logger.info(f"在初始页面找到[提交按钮]，区域坐标: {submit_pos}")
         return submit_pos, False  # 找到，且未滚动
+
     # 步骤 2: 如果没找到，开始循环滚动查找
     logger.info(f"未找到[提交按钮]，开始滚动查找 (最多 {MAX_SCROLL_ATTEMPTS} 次)...")
     for i in range(MAX_SCROLL_ATTEMPTS):
         logger.info(f"--- 第 {i + 1}/{MAX_SCROLL_ATTEMPTS} 次滚动尝试 ---")
-        
-        # 调用滚动分发器，它会根据配置执行正确的滚动操作
         scroll_in_region()
         time.sleep(POST_SCROLL_DELAY)
         
-        # 重新截图并查找
+        # 重新截图，但此时暂不保存
         screen_img = capture_region()
         submit_pos = TEMPLATE_SUBMIT.match_in(screen_img)
         
         if submit_pos:
             logger.info(f"在第 {i + 1} 次滚动后找到[提交按钮]，区域坐标: {submit_pos}")
+            # 找到按钮后，保存第二张截图
+            screenshot_path_2 = os.path.join(screenshot_dir, f"{safe_q_num}_2.png")
+            # 使用cv2.imwrite保存numpy数组格式的图片
+            cv2.imwrite(screenshot_path_2, screen_img)
+            logger.info(f"已保存滚动后的截图: {screenshot_path_2}")
             return submit_pos, True # 找到，且已滚动
     
     # 步骤 3: 如果循环结束仍未找到，则判定失败
     logger.warning(f"在 {MAX_SCROLL_ATTEMPTS} 次滚动后仍未找到[提交按钮]！")
     return None, True # 未找到，且已滚动
+# ============================ 【修改结束】 ============================
 
 def find_available_options():
     available = {}
-    screen_img = capture_region()
+    screen_img = capture_region() # 只获取图像，不保存
     for name, template_list in sorted(TEMPLATE_OPTIONS.items()):
         for template in template_list:
             pos = template.match_in(screen_img)
@@ -246,17 +259,14 @@ def solve_multiple_choice(current_q_num, options, submit_pos):
     # ... (此函数无需修改) ...
     logger.info(f"开始解答多选题: {current_q_num}")
     option_names = sorted(options.keys())
-    
     for attempt in range(1, MAX_MULTI_CHOICE_ATTEMPTS + 1):
         logger.info(f"--- 开始第 {attempt}/{MAX_MULTI_CHOICE_ATTEMPTS} 轮多选题尝试 ---")
         last_combo = set()
-        
         start_combination_size = 2 if len(option_names) > 1 else 1
         for i in range(start_combination_size, len(option_names) + 1):
             for combo in combinations(option_names, i):
                 current_combo = set(combo)
                 logger.info(f"尝试多选组合: {list(current_combo)}")
-                
                 options_to_unselect = last_combo - current_combo
                 options_to_select = current_combo - last_combo
                 for opt in options_to_unselect: 
@@ -266,7 +276,6 @@ def solve_multiple_choice(current_q_num, options, submit_pos):
                     click_at_region_pos(options[opt])
                     time.sleep(POST_TOUCH_DELAY)
                 click_at_region_pos(submit_pos)
-                
                 if wait_for_next_question(current_q_num):
                     return True
                 else:
@@ -290,7 +299,6 @@ def wait_for_next_question(current_q_num):
     return new_q_num and new_q_num != current_q_num
 
 def main_loop():
-    # ... (此函数无需修改) ...
     last_question_num = "初始化"
     logger.info("脚本将在3秒后开始，请确保投屏窗口在前台且无遮挡...")
     time.sleep(3)
@@ -304,7 +312,9 @@ def main_loop():
         if q_num != last_question_num:
             logger.info(f"检测到新题目: {q_num} (上一题: {last_question_num})")
             
-            submit_pos, scrolled = find_submit_button_with_scroll()
+            # 【核心修改】调用重构后的函数，传入题号和本次运行的截图目录
+            submit_pos, scrolled = find_submit_button_with_scroll(q_num, SCREENSHOT_RUN_DIR)
+            
             if not submit_pos:
                 logger.error(f"在题目 {q_num} 找不到[提交按钮]，脚本无法继续。"); break
             
