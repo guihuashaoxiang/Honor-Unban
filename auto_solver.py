@@ -1,4 +1,4 @@
-# -*- encoding=utf8 -*-
+# auto_solver.py
 import os
 import re
 import time
