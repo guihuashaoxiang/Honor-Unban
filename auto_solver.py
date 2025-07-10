@@ -5,16 +5,13 @@ import time
 import logging
 from itertools import combinations
 from collections import defaultdict
-
 # 桌面自动化核心库
 import pyautogui
 from airtest.core.cv import Template
 from paddleocr import PaddleOCR
-
 # 引入转换所需的库
 import numpy as np
 import cv2
-
 # ==================== 日志配置 START ====================
 # (日志部分保持不变)
 logger = logging.getLogger(__name__)
@@ -30,30 +27,27 @@ if not logger.handlers:
     logger.addHandler(console_handler)
 # ==================== 日志配置 END ====================
 
-
 # ==============================================================================
 # ============================ 全局配置 (请仔细阅读) =============================
 # ==============================================================================
-
 # ------------------- 区域与核心配置 (必须修改) -------------------
 SCREEN_REGION = (2481, 0, 901, 2063)
-# 【新增】等待模式，SMART或FIXED，SMART模式下会自动判断是否刷新页面，FIXED模式下不会自动刷新
-WAIT_MODE = 'FIXED'
+
+# 【新增配置】滚动模式，用于兼容不同平台的滚动方式
+# 'MOBILE_DRAG': 仅使用拖拽滚动，适用于手机投屏。
+# 'PC_WHEEL'   : 仅使用鼠标滚轮滚动，适用于电脑版微信小程序等PC应用。
+# 'BOTH'       : (默认) 先执行拖拽滚动，再执行滚轮滚动，以最大程度保证兼容性。
+SCROLL_MODE = 'BOTH'
 
 # ------------------- 速度与延时控制 (可按需微调) -------------------
 FIXED_POST_SUBMIT_DELAY = 1
-SMART_RECHECK_INTERVAL = 0.5
-SMART_MAX_WAIT_FOR_REFRESH = 8.0
 POST_TOUCH_DELAY = 0.8
-# 【新增】每次滚动操作后的等待时间（秒），给UI足够的时间响应
 POST_SCROLL_DELAY = 1.5
 
 # ------------------- 容错与重试机制 (可按需微调) -------------------
 MAX_SINGLE_CHOICE_ATTEMPTS = 2
 MAX_MULTI_CHOICE_ATTEMPTS = 3
-# 【新增配置】当找不到提交按钮时，最大滚动屏幕的尝试次数
 MAX_SCROLL_ATTEMPTS = 3
-
 
 # ------------------- 资源与模型定义 (一般无需修改) -------------------
 # ... (此部分保持不变) ...
@@ -63,7 +57,6 @@ TEMPLATES_DIR = "templates"
 if not os.path.exists(TEMPLATES_DIR): 
     os.makedirs(TEMPLATES_DIR)
     logger.warning(f"模板目录 '{TEMPLATES_DIR}' 不存在，已自动创建。请将模板图片放入其中。")
-
 def load_option_templates(directory, threshold=0.7):
     logger.info(f"开始从 '{directory}' 目录加载选项模板...")
     option_templates = defaultdict(list)
@@ -87,26 +80,22 @@ def load_option_templates(directory, threshold=0.7):
     if not option_templates:
         logger.warning("警告：未加载到任何符合 'option_[A-D]_[n].png' 格式的选项模板！")
     return dict(option_templates)
-
 TEMPLATE_SUBMIT = Template(os.path.join(TEMPLATES_DIR, "submit_button.png"), threshold=0.85)
 TEMPLATE_OPTIONS = load_option_templates(TEMPLATES_DIR, threshold=0.7)
-
 logger.info("正在初始化OCR模型...")
 try:
     ocr = PaddleOCR(use_angle_cls=True, lang='ch', use_gpu=False, show_log=False)
     logger.info("OCR模型初始化完成。")
 except Exception as e:
     logger.error(f"OCR模型初始化失败: {e}"); exit()
-
 logger.info(f"=========== 配置加载 ===========")
 logger.info(f"投屏区域 (Region): {SCREEN_REGION}")
+logger.info(f"滚动模式 (Scroll Mode): {SCROLL_MODE}") # 新增日志
 logger.info(f"滚动后延时 (Scroll Delay): {POST_SCROLL_DELAY}s")
 logger.info(f"最大滚动次数 (Scroll Retries): {MAX_SCROLL_ATTEMPTS}")
 # ... (其余打印语句保持不变) ...
 
-
 # --- 桌面操作核心函数 ---
-# ... (capture_region, find_in_region, click_at_region_pos, scroll_in_region 保持不变) ...
 def capture_region(filename=None):
     pil_img = pyautogui.screenshot(region=SCREEN_REGION)
     if filename:
@@ -115,14 +104,6 @@ def capture_region(filename=None):
     opencv_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
     return opencv_img
 
-def find_in_region(template):
-    # 【优化】find_in_region现在只负责匹配，不再截图，由调用方传入截图
-    # 这可以避免在一次查找中（如find_submit_button_with_scroll）重复截图
-    # screen_img = capture_region() # 旧代码
-    # match_pos = template.match_in(screen_img) # 旧代码
-    # return match_pos
-    pass # 函数体现在合并到调用方了，这里先留空，或者直接删除此函数，但为减少改动保留
-
 def click_at_region_pos(region_pos):
     if not region_pos: return
     absolute_x = SCREEN_REGION[0] + region_pos[0]
@@ -130,8 +111,12 @@ def click_at_region_pos(region_pos):
     logger.info(f"执行点击: 区域坐标={region_pos}, 屏幕绝对坐标=({absolute_x}, {absolute_y})")
     pyautogui.click(absolute_x, absolute_y)
 
-def scroll_in_region():
-    logger.info(f"执行自定义拖动滚动...")
+# ============================ 【核心修改部分：滚动逻辑】 ============================
+def _scroll_with_drag():
+    """
+    内部函数：执行拖拽滚动（适用于手机投屏）。
+    """
+    logger.info("执行[拖动滚动] (适用于手机投屏)...")
     region_x, region_y, region_w, region_h = SCREEN_REGION
     drag_center_x = region_x + region_w // 2
     start_y = region_y + region_h * 0.70
@@ -140,7 +125,43 @@ def scroll_in_region():
     pyautogui.mouseDown()
     pyautogui.moveTo(drag_center_x, end_y, duration=0.5)
     pyautogui.mouseUp()
-    logger.info("自定义拖动完成。")
+    logger.info("拖动滚动完成。")
+
+def _scroll_with_wheel():
+    """
+    内部函数：执行鼠标滚轮滚动（适用于PC原生应用）。
+    """
+    logger.info("执行[PC滚轮滚动] (适用于电脑应用)...")
+    region_x, region_y, region_w, region_h = SCREEN_REGION
+    # 将鼠标移动到区域中心，确保滚动作用于正确窗口
+    center_x = region_x + region_w // 2
+    center_y = region_y + region_h // 2
+    pyautogui.moveTo(center_x, center_y, duration=0.2)
+    # 执行向下滚动，负值表示向下滚动，数值大小表示滚动幅度
+    pyautogui.scroll(-500) 
+    logger.info("PC滚轮滚动完成。")
+
+def scroll_in_region():
+    """
+    【重构】滚动分发函数。根据 SCROLL_MODE 配置调用不同的滚动方法。
+    这是对外暴露的唯一滚动接口。
+    """
+    logger.info(f"根据配置 [{SCROLL_MODE}] 执行滚动操作...")
+    
+    if SCROLL_MODE == 'MOBILE_DRAG':
+        _scroll_with_drag()
+    elif SCROLL_MODE == 'PC_WHEEL':
+        _scroll_with_wheel()
+    elif SCROLL_MODE == 'BOTH':
+        # 在'BOTH'模式下，两种滚动方式都会执行，以提高成功率
+        logger.info("-> 模式'BOTH': 先执行[拖动滚动]，再执行[PC滚轮滚动]。")
+        _scroll_with_drag()
+        time.sleep(0.3) # 在两种滚动之间短暂暂停，避免操作过快
+        _scroll_with_wheel()
+    else:
+        logger.warning(f"未知的 SCROLL_MODE: '{SCROLL_MODE}'。将执行默认的拖动滚动。")
+        _scroll_with_drag()
+# ============================ 【修改结束】 ============================
     
 # --- 逻辑函数 ---
 def get_screen_info():
@@ -158,10 +179,10 @@ def get_screen_info():
     except Exception:
         return None, "单选题"
 
-# ============================ 【核心修改部分】 ============================
 def find_submit_button_with_scroll():
     """
-    【已重构】查找提交按钮，如果找不到，会循环滚动屏幕最多 MAX_SCROLL_ATTEMPTS 次。
+    查找提交按钮，如果找不到，会循环滚动屏幕最多 MAX_SCROLL_ATTEMPTS 次。
+    【无需修改】此函数调用了新的 scroll_in_region() 分发器，自动适配滚动模式。
     """
     # 步骤 1: 在当前屏幕直接查找，不滚动
     screen_img = capture_region()
@@ -169,13 +190,12 @@ def find_submit_button_with_scroll():
     if submit_pos:
         logger.info(f"在当前页面找到[提交按钮]，区域坐标: {submit_pos}")
         return submit_pos, False  # 找到，且未滚动
-
     # 步骤 2: 如果没找到，开始循环滚动查找
     logger.info(f"未找到[提交按钮]，开始滚动查找 (最多 {MAX_SCROLL_ATTEMPTS} 次)...")
     for i in range(MAX_SCROLL_ATTEMPTS):
         logger.info(f"--- 第 {i + 1}/{MAX_SCROLL_ATTEMPTS} 次滚动尝试 ---")
         
-        # 执行滚动并等待
+        # 调用滚动分发器，它会根据配置执行正确的滚动操作
         scroll_in_region()
         time.sleep(POST_SCROLL_DELAY)
         
@@ -190,7 +210,6 @@ def find_submit_button_with_scroll():
     # 步骤 3: 如果循环结束仍未找到，则判定失败
     logger.warning(f"在 {MAX_SCROLL_ATTEMPTS} 次滚动后仍未找到[提交按钮]！")
     return None, True # 未找到，且已滚动
-# ============================ 【修改结束】 ============================
 
 def find_available_options():
     available = {}
@@ -206,8 +225,8 @@ def find_available_options():
         logger.warning("未在屏幕上找到任何已定义的选项 (A, B, C, D)。")
     return available
 
-# ... 所有后续函数 (solve_single_choice, main_loop 等) 都保持原样，无需任何修改 ...
 def solve_single_choice(current_q_num, options, submit_pos):
+    # ... (此函数无需修改) ...
     logger.info(f"开始解答单选题: {current_q_num}")
     for attempt in range(1, MAX_SINGLE_CHOICE_ATTEMPTS + 1):
         logger.info(f"--- 开始第 {attempt}/{MAX_SINGLE_CHOICE_ATTEMPTS} 轮单选题尝试 ---")
@@ -224,6 +243,7 @@ def solve_single_choice(current_q_num, options, submit_pos):
     return False
 
 def solve_multiple_choice(current_q_num, options, submit_pos):
+    # ... (此函数无需修改) ...
     logger.info(f"开始解答多选题: {current_q_num}")
     option_names = sorted(options.keys())
     
@@ -239,14 +259,12 @@ def solve_multiple_choice(current_q_num, options, submit_pos):
                 
                 options_to_unselect = last_combo - current_combo
                 options_to_select = current_combo - last_combo
-
                 for opt in options_to_unselect: 
                     click_at_region_pos(options[opt])
                     time.sleep(POST_TOUCH_DELAY)
                 for opt in options_to_select: 
                     click_at_region_pos(options[opt])
                     time.sleep(POST_TOUCH_DELAY)
-
                 click_at_region_pos(submit_pos)
                 
                 if wait_for_next_question(current_q_num):
@@ -254,41 +272,25 @@ def solve_multiple_choice(current_q_num, options, submit_pos):
                 else:
                     logger.info(f"组合 {list(current_combo)} 错误，继续...")
                     last_combo = current_combo
-
         logger.warning(f"第 {attempt} 轮所有组合尝试完成，题目仍未改变。")
         logger.info("重置所有选项为未选中状态，准备开始下一轮...")
         if last_combo:
             for opt in last_combo:
                 click_at_region_pos(options[opt])
                 time.sleep(POST_TOUCH_DELAY)
-
     logger.error(f"多选题 {current_q_num} 在 {MAX_MULTI_CHOICE_ATTEMPTS} 轮尝试后仍未解决。")
     return False
 
 def wait_for_next_question(current_q_num):
-    if WAIT_MODE == 'SMART': return _smart_wait(current_q_num)
-    else: return _fixed_wait(current_q_num)
-
-def _fixed_wait(current_q_num):
-    logger.info(f"采用[固定延时]策略，等待 {FIXED_POST_SUBMIT_DELAY} 秒...")
+    # ... (此函数无需修改) ...
+    logger.info(f"采用[固定延时]策略，等待 {FIXED_POST_SUBMIT_DELAY} 秒以确认页面是否刷新...")
     time.sleep(FIXED_POST_SUBMIT_DELAY)
     new_q_num, _ = get_screen_info()
-    logger.info(f"延时结束，重新识别... {f'新题号: {new_q_num}' if new_q_num else '未识别到题号'}")
+    logger.info(f"延时结束，重新识别屏幕... {f'新题号: {new_q_num}' if new_q_num else '未识别到题号'}")
     return new_q_num and new_q_num != current_q_num
 
-def _smart_wait(current_q_num):
-    logger.info(f"采用[智能动态等待]策略... (超时: {SMART_MAX_WAIT_FOR_REFRESH}s)")
-    start_time = time.time()
-    while time.time() - start_time < SMART_MAX_WAIT_FOR_REFRESH:
-        new_q_num, _ = get_screen_info()
-        logger.info(f"重新识别... {f'新题号: {new_q_num}' if new_q_num else '未识别到题号'}")
-        if new_q_num and new_q_num != current_q_num:
-            return True
-        time.sleep(SMART_RECHECK_INTERVAL)
-    logger.warning("等待超时！页面未在规定时间内刷新到下一题。")
-    return False
-
 def main_loop():
+    # ... (此函数无需修改) ...
     last_question_num = "初始化"
     logger.info("脚本将在3秒后开始，请确保投屏窗口在前台且无遮挡...")
     time.sleep(3)
@@ -302,22 +304,16 @@ def main_loop():
         if q_num != last_question_num:
             logger.info(f"检测到新题目: {q_num} (上一题: {last_question_num})")
             
-            # main_loop中对find_submit_button_with_scroll的调用无需修改
-            # 它已经能正确处理新函数返回的结果
             submit_pos, scrolled = find_submit_button_with_scroll()
             if not submit_pos:
-                # 只有在多次滚动后仍然找不到按钮，才会执行到这里
                 logger.error(f"在题目 {q_num} 找不到[提交按钮]，脚本无法继续。"); break
-
-            safe_q_num = re.sub(r'[\\/*?:"<>|]', "", q_num)
-            # 优化：截图逻辑调整到查找函数内部，避免重复截图
-            # capture_region(filename=f"{screenshot_base}.png") # 旧代码
-            logger.info(f"已对题目 {safe_q_num} 的屏幕状态进行分析。")
+            
+            logger.info(f"已对题目 {q_num} 的屏幕状态进行分析。")
             
             options = find_available_options()
             if not options:
                 logger.error(f"在题目 {q_num} 找不到任何选项，脚本无法继续。"); break
-
+            
             success = False
             if q_type == "单选题":
                 success = solve_single_choice(q_num, options, submit_pos)
@@ -330,7 +326,6 @@ def main_loop():
                 logger.critical(f"题目 {q_num} 未能成功解答，脚本终止！"); break
         else:
             logger.info(f"题号未变({q_num})，可能上次提交错误或在等待。等待2秒..."); time.sleep(2)
-
 
 if __name__ == "__main__":
     try:
