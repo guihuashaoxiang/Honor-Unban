@@ -23,7 +23,7 @@ SCREENSHOT_BASE_DIR = "screenshots"
 SCREENSHOT_RUN_DIR = os.path.join(SCREENSHOT_BASE_DIR, RUN_TIMESTAMP)
 if not os.path.exists(SCREENSHOT_RUN_DIR): os.makedirs(SCREENSHOT_RUN_DIR)
 
-# 【新增】全局变量，用于存储已解答的题目及其正确答案
+# 全局变量，用于存储已解答的题目及其正确答案
 solved_questions = {}
 
 # ==================== 日志配置 START ====================
@@ -43,10 +43,10 @@ if not logger.handlers:
 # ==============================================================================
 # ============================ 全局配置 =============================
 # ==============================================================================
-SCREEN_REGION = (2481, 0, 901, 2063)
-SCROLL_MODE = 'BOTH'
-FIXED_POST_SUBMIT_DELAY = 1
-POST_TOUCH_DELAY = 0.8
+SCREEN_REGION = (2959, 0, 828, 2062)
+SCROLL_MODE = 'PC_WHEEL'    # 选择滚动模式，可选值：'MOBILE_DRAG', 'PC_WHEEL', 'BOTH'
+FIXED_POST_SUBMIT_DELAY = 0.8
+POST_TOUCH_DELAY = 0.5
 POST_SCROLL_DELAY = 1.5
 MAX_SINGLE_CHOICE_ATTEMPTS = 2
 MAX_MULTI_CHOICE_ATTEMPTS = 3
@@ -57,8 +57,9 @@ TEMPLATES_DIR = "templates"
 if not os.path.exists(TEMPLATES_DIR): 
     os.makedirs(TEMPLATES_DIR)
     logger.warning(f"模板目录 '{TEMPLATES_DIR}' 不存在，已自动创建。请将模板图片放入其中。")
+
 def load_option_templates(directory, threshold=0.7):
-    # ... (此函数无需修改) ...
+    # (此函数无需修改)
     logger.info(f"开始从 '{directory}' 目录加载选项模板...")
     option_templates = defaultdict(list)
     try:
@@ -75,11 +76,27 @@ def load_option_templates(directory, threshold=0.7):
             template = Template(full_path, threshold=threshold)
             option_templates[option_name].append(template)
             logger.info(f"  -> 已加载模板: {filename} for Option {option_name}")
+    
+    # 【新增验证】检查是否至少加载了A,B,C,D四种选项的模板文件
+    required_options = {'A', 'B', 'C', 'D'}
+    loaded_options = set(option_templates.keys())
+    if not required_options.issubset(loaded_options):
+        missing = required_options - loaded_options
+        logger.error(f"模板文件不完整！templates文件夹中缺少选项 {sorted(list(missing))} 的模板图片。")
+        logger.error("请确保A, B, C, D每个选项至少有一个模板图片（如 option_A_1.png）。")
+        return {} # 返回空字典，后续会触发错误并退出
+        
     logger.info("选项模板加载完成。")
     return dict(option_templates)
 
-TEMPLATE_SUBMIT = Template(os.path.join(TEMPLATES_DIR, "submit_button.png"), threshold=0.85)
-TEMPLATE_OPTIONS = load_option_templates(TEMPLATES_DIR, threshold=0.7)
+TEMPLATE_SUBMIT = Template(os.path.join(TEMPLATES_DIR, "submit_button.png"), threshold=0.6)
+TEMPLATE_OPTIONS = load_option_templates(TEMPLATES_DIR, threshold=0.6)
+
+# 【新增】如果模板加载失败，TEMPLATE_OPTIONS会为空，直接终止
+if not TEMPLATE_OPTIONS:
+    logger.critical("由于选项模板加载失败，脚本无法继续运行。")
+    exit()
+
 logger.info("正在初始化OCR模型...")
 try:
     ocr = PaddleOCR(use_angle_cls=True, lang='ch', use_gpu=False, show_log=False)
@@ -93,7 +110,7 @@ logger.info(f"投屏区域 (Region): {SCREEN_REGION}")
 logger.info(f"滚动模式 (Scroll Mode): {SCROLL_MODE}")
 
 # --- 桌面操作核心函数 ---
-# ... (capture_region, click_at_region_pos, scroll* 函数均无需修改) ...
+# (capture_region, click_at_region_pos, scroll* 函数均无需修改)
 def capture_region(filename=None):
     pil_img = pyautogui.screenshot(region=SCREEN_REGION)
     if filename:
@@ -126,7 +143,7 @@ def scroll_in_region():
 
 # --- 逻辑函数 ---
 def get_screen_info():
-    # ... (此函数无需修改) ...
+    # (此函数无需修改)
     screen_img = capture_region()
     try:
         result = ocr.ocr(screen_img, cls=True)
@@ -139,7 +156,7 @@ def get_screen_info():
     except Exception: return None, "单选题"
 
 def find_submit_button_with_scroll(q_num, screenshot_dir):
-    # ... (此函数无需修改) ...
+    # (此函数无需修改)
     safe_q_num = re.sub(r'[\\/*?:"<>|]', "_", q_num)
     screenshot_path_1 = os.path.join(screenshot_dir, f"{safe_q_num}_1.png")
     screen_img = capture_region(filename=screenshot_path_1)
@@ -158,16 +175,66 @@ def find_submit_button_with_scroll(q_num, screenshot_dir):
     logger.warning(f"滚动后仍未找到[提交按钮]！"); return None, True
 
 def find_available_options():
-    # ... (此函数无需修改) ...
+    # (此函数无需修改)
     available = {}; screen_img = capture_region()
     for name, template_list in sorted(TEMPLATE_OPTIONS.items()):
         for template in template_list:
             pos = template.match_in(screen_img)
             if pos: available[name] = pos; break
-    if not available: logger.warning("未找到任何选项 (A, B, C, D)。")
+    if not available: logger.warning("在当前屏幕上未找到任何选项 (A, B, C, D)。")
     return available
 
-# ============================ 【核心修改部分：解答函数返回正确答案】 ============================
+# ============================ 【核心新增：启动前校验函数】 ============================
+def validate_all_options_visible():
+    """
+    在脚本主循环开始前，执行一次性屏幕校验。
+    确保 A, B, C, D 四个选项的模板都能在当前屏幕上被匹配到。
+    如果任意一个匹配失败，则打印错误信息并终止脚本。
+    """
+    logger.info("="*20 + " 开始初始环境校验 " + "="*20)
+    logger.info("脚本将在3秒后进行屏幕选项校验，请确保答题界面已完整显示并包含所有选项。")
+    time.sleep(3)
+    
+    # 截取一张当前屏幕的图像用于校验
+    validation_screenshot_path = os.path.join(SCREENSHOT_RUN_DIR, "validation_screenshot.png")
+    screen_img = capture_region(filename=validation_screenshot_path)
+    
+    # 获取所有需要被找到的选项（通常是 A, B, C, D）
+    expected_options = set(TEMPLATE_OPTIONS.keys())
+    
+    # 查找当前屏幕上能匹配到的选项
+    found_options_map = {}
+    for name, template_list in sorted(TEMPLATE_OPTIONS.items()):
+        for template in template_list:
+            pos = template.match_in(screen_img)
+            if pos:
+                found_options_map[name] = pos
+                break # 找到该选项的一个模板即可，继续找下一个选项
+                
+    found_options = set(found_options_map.keys())
+    
+    # 比较期望找到的与实际找到的
+    if expected_options.issubset(found_options):
+        logger.info("✅ [校验通过] 所有必需的选项模板 (A, B, C, D) 均已成功匹配。")
+        for opt, pos in sorted(found_options_map.items()):
+            logger.info(f"  -> 选项 [{opt}] 在位置 {pos} 找到。")
+        logger.info("="*20 + " 校验完成，即将开始答题 " + "="*20)
+        return True
+    else:
+        # 如果有选项未找到，计算出是哪些，并报错退出
+        missing_options = expected_options - found_options
+        logger.critical("❌ [校验失败] 未能匹配到所有必需的选项模板！")
+        logger.critical(f"  -> 缺失的选项: {sorted(list(missing_options))}")
+        logger.critical("  -> 请按以下步骤排查问题后，重新运行脚本:")
+        logger.critical("     1. 确认答题窗口/手机投屏是否在最前端，并且 A,B,C,D 四个选项清晰可见。")
+        logger.critical(f"     2. 检查 'SCREEN_REGION' 配置 {SCREEN_REGION} 是否准确框选了答题区域。")
+        logger.critical(f"     3. 检查 'templates' 文件夹中缺失选项的模板图片是否准确、清晰。建议为缺失项【重新截图】。")
+        logger.critical(f"     4. 如果截图无误，可尝试适当【降低】 'load_option_templates' 函数中的 `threshold` (匹配度) 值。")
+        logger.critical("脚本将终止运行。")
+        return False
+# ============================ 【新增结束】 ============================
+
+# ============================ 解答函数 ============================
 def solve_single_choice(current_q_num, options, submit_pos):
     """【已重构】解答单选题，成功后返回正确选项。"""
     logger.info(f"开始解答单选题: {current_q_num}")
@@ -217,16 +284,15 @@ def solve_multiple_choice(current_q_num, options, submit_pos):
             for opt in last_combo: click_at_region_pos(options[opt]); time.sleep(POST_TOUCH_DELAY)
     logger.error(f"多选题 {current_q_num} 在 {MAX_MULTI_CHOICE_ATTEMPTS} 轮尝试后仍未解决。")
     return None # 所有尝试失败，返回 None
-# ============================ 【修改结束】 ============================
 
 def wait_for_next_question(current_q_num):
-    # ... (此函数无需修改) ...
+    # (此函数无需修改)
     logger.info(f"采用[固定延时]策略，等待 {FIXED_POST_SUBMIT_DELAY} 秒...")
     time.sleep(FIXED_POST_SUBMIT_DELAY)
     new_q_num, _ = get_screen_info()
     return new_q_num and new_q_num != current_q_num
 
-# ============================ 【核心新增部分：写入答案映射文件】 ============================
+# ============================ 写入答案映射文件 ============================
 def write_solution_map_to_file():
     """
     将已解答的题目和答案写入到本次运行的截图中文件夹下的 aolution_map.txt 文件。
@@ -246,12 +312,11 @@ def write_solution_map_to_file():
         logger.info("答案映射文件写入成功。")
     except Exception as e:
         logger.error(f"写入答案映射文件失败: {e}")
-# ============================ 【修改结束】 ============================
 
 def main_loop():
     last_question_num = "初始化"
-    logger.info("脚本将在3秒后开始...")
-    time.sleep(3)
+    # logger.info("脚本将在3秒后开始...") # 这句移至校验函数中
+    # time.sleep(3)
     while True:
         logger.info("\n" + "="*20 + " 新一轮检测循环 " + "="*20)
         q_num, q_type = get_screen_info()
@@ -275,7 +340,6 @@ def main_loop():
             else: # 多选题
                 correct_answer = solve_multiple_choice(q_num, options, submit_pos)
             
-            # 【核心修改】处理解答函数返回的结果
             if correct_answer:
                 # 如果成功解答，记录答案
                 solved_questions[q_num] = correct_answer
@@ -288,12 +352,23 @@ def main_loop():
 
 if __name__ == "__main__":
     try:
+        # ============================ 【核心修改：执行启动校验】 ============================
+        # 在主循环开始前，执行严格的屏幕选项校验
+        # 如果校验失败，函数内部会打印详细错误日志，并返回False，程序直接退出
+        if not validate_all_options_visible():
+            # 此处不需要再打印日志，因为校验函数已经处理了
+            # 直接退出，让用户根据提示进行修正
+            exit()
+        # ============================ 【修改结束】 ============================
+        
+        # 校验通过后，才开始正式的答题循环
         main_loop()
+
     except pyautogui.FailSafeException:
         logger.critical("Fail-Safe触发！鼠标移动到屏幕左上角，脚本已紧急停止。")
     except Exception as e:
         logger.exception("脚本运行过程中发生未处理的异常！")
     finally:
-        # 【核心修改】确保无论脚本如何退出，都会尝试写入答案文件
+        # 确保无论脚本如何退出，都会尝试写入答案文件
         write_solution_map_to_file()
         logger.info("脚本执行结束。")
