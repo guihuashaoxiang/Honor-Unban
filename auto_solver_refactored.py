@@ -122,17 +122,17 @@ INITIAL_VALIDATION_DELAY = 3.0
 
 # --- 已有延时配置 ---
 # 提交答案后，等待题目刷新的固定延时（秒）。
-FIXED_POST_SUBMIT_DELAY = 0.8
+FIXED_POST_SUBMIT_DELAY = 1
 # 每次点击选项后的等待时间（秒）。如果点击后UI反应慢，可适当增加此值。
-POST_TOUCH_DELAY = 0.4
+POST_TOUCH_DELAY = 0.6
 
 # 初始化时，点击“提交”按钮激活窗口后的等待时间，以确保窗口状态稳定。
 # 默认值: 1.0
 POST_ACTIVATION_CLICK_DELAY = 1.0
 
 # 在主循环中，如果检测到题目内容没有变化，脚本将等待此时间后再次检查。
-# 默认值: 30
-POLLING_INTERVAL_NO_CHANGE = 30
+# 默认值: 2
+POLLING_INTERVAL_NO_CHANGE = 2
 
 # 在主循环中，如果无法获取到题目信息（可能应用卡死或已结束），脚本等待此时间后重试。
 # 默认值: 5.0
@@ -140,19 +140,19 @@ RETRY_DELAY_ON_ERROR = 3
 
 # 模拟“全选”(Ctrl+A)后，等待系统响应的时间。
 # 默认值: 0.1
-DELAY_AFTER_SELECT_ALL = 0.05
+DELAY_AFTER_SELECT_ALL = 0.1
 
 # 模拟“复制”(Ctrl+C)后，等待内容进入剪贴板的时间。
 # 默认值: 0.2
-DELAY_AFTER_COPY = 0.1
+DELAY_AFTER_COPY = 0.2
 
 # 在多选题验证点击中，完成一系列点击操作后，等待UI稳定再进行HTML验证的延时。
-# 默认值: 0.3
+# 默认值: 0.5
 DELAY_BEFORE_VERIFY_CLICK = 0.5
 
 # 当滚动模式为 'BOTH' 时，在两种滚动方式（拖动和滚轮）之间的延时，防止操作冲突。
 # 默认值: 0.3
-DELAY_BETWEEN_SCROLL_METHODS = 0.3
+DELAY_BETWEEN_SCROLL_METHODS = 0.5
 
 # 每次滚动操作后的等待时间（秒），确保页面内容已加载完毕。
 POST_SCROLL_DELAY = 1.5
