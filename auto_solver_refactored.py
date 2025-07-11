@@ -12,6 +12,18 @@ from airtest.core.cv import Template
 import numpy as np
 import cv2
 
+# ============================ 新增依赖库导入 ============================
+try:
+    import win32clipboard
+    from bs4 import BeautifulSoup
+    IS_WINDOWS = True
+except ImportError:
+    IS_WINDOWS = False
+    print("警告：未找到 'pywin32' 或 'beautifulsoup4' 库。HTML验证功能将不可用。")
+    print("请运行 'pip install pywin32 beautifulsoup4' 来安装。")
+# =========================================================================
+
+
 # ============================ 动态路径与全局变量配置 ============================
 RUN_TIMESTAMP = time.strftime('%Y%m%d_%H%M%S')
 LOG_DIR = "logs"
@@ -23,10 +35,9 @@ if not os.path.exists(SCREENSHOT_RUN_DIR): os.makedirs(SCREENSHOT_RUN_DIR)
 
 # 全局变量
 solved_questions = {}
-qa_bank = {} # 【新增】用于存放从文件加载的主题库
+qa_bank = {}
 
 # ==================== 日志配置 START ====================
-# (日志部分保持不变)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -45,23 +56,21 @@ if not logger.handlers:
 SCREEN_REGION = (2959, 0, 828, 2062)
 SCROLL_MODE = 'PC_WHEEL'
 FIXED_POST_SUBMIT_DELAY = 1
-POST_TOUCH_DELAY = 0.8
+POST_TOUCH_DELAY = 0.5  # 适当降低延时，因为有验证机制
 POST_SCROLL_DELAY = 1.5
 MAX_SINGLE_CHOICE_ATTEMPTS = 2
 MAX_MULTI_CHOICE_ATTEMPTS = 3
 MAX_SCROLL_ATTEMPTS = 3
-STOP_AT_QUESTION_NUM = "第78题" # "第78题" 或 None
+STOP_AT_QUESTION_NUM = "第78题"
 
-# ============================ 【新增】题库配置 ============================
-# 是否启用题库进行快速答题
+# ============================ 题库配置 ============================
 USE_QA_BANK = True
-# 主题库文件路径
 QA_BANK_FILE = "master_qa_bank.json"
+
 # ===========================================================================
 
 
 # ------------------- 资源与模板定义 -------------------
-# (load_option_templates, TEMPLATE_SUBMIT, TEMPLATE_OPTIONS 定义保持不变)
 TEMPLATES_DIR = "templates"
 if not os.path.exists(TEMPLATES_DIR): 
     os.makedirs(TEMPLATES_DIR)
@@ -105,9 +114,10 @@ logger.info(f"日志文件将保存至: {LOG_FILE_PATH}")
 logger.info(f"本次运行截图将保存至: {SCREENSHOT_RUN_DIR}")
 logger.info(f"投屏区域 (Region): {SCREEN_REGION}")
 logger.info(f"启用题库模式: {'是' if USE_QA_BANK else '否'}")
+logger.info(f"启用HTML验证: {'是' if IS_WINDOWS else '否 (环境不支持)'}")
+
 
 # --- 桌面操作核心函数 ---
-# (capture_region, click_at_region_pos, scroll* 函数均无需修改)
 def capture_region(filename=None):
     pil_img = pyautogui.screenshot(region=SCREEN_REGION)
     if filename:
@@ -139,50 +149,158 @@ def scroll_in_region():
     else: _scroll_with_drag()
 
 
-# --- 逻辑函数 ---
+# ============================ 【核心升级】剪贴板解析函数 ============================
+def _get_html_from_clipboard():
+    """尝试从剪贴板读取'HTML Format'内容。"""
+    if not IS_WINDOWS: return None
+    try:
+        win32clipboard.OpenClipboard()
+        html_format = win32clipboard.RegisterClipboardFormat("HTML Format")
+        if win32clipboard.IsClipboardFormatAvailable(html_format):
+            data = win32clipboard.GetClipboardData(html_format)
+            # 找到HTML内容的起始位置
+            match = re.search(b"StartFragment:(\\d+)", data)
+            if match:
+                start_index = int(match.group(1))
+                # 解码为utf-8字符串，忽略错误
+                return data[start_index:].decode('utf-8', errors='ignore')
+    except Exception as e:
+        logger.warning(f"读取剪贴板HTML格式时出错: {e}")
+    finally:
+        if IS_WINDOWS:
+            win32clipboard.CloseClipboard()
+    return None
 
-# (get_question_from_clipboard, find_submit_button_with_scroll, find_available_options, validate_all_options_visible, initialize_and_activate 均无需修改)
-def get_question_from_clipboard():
+def _parse_html_data(html_content):
+    """
+    【升级版】使用BeautifulSoup解析HTML，提取问题、选项和选中状态。
+    此版本兼容文字题、视频题和图片题的HTML结构。
+    """
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # 提取题号和类型 (这部分结构通用，无需修改)
+        title_count_div = soup.find('div', class_='ts_title_count')
+        if not title_count_div: return None
+        q_num_tag = title_count_div.find('i')
+        q_type_tag = title_count_div.find('em')
+        q_num = q_num_tag.get_text(strip=True) if q_num_tag else ""
+        q_type = f"{q_type_tag.get_text(strip=True)}题" if q_type_tag else ""
+
+        # 提取问题文本 (这部分结构通用，无需修改)
+        q_text_div = soup.find('div', class_='ts_title_text')
+        if not q_text_div: return None
+        q_text = q_text_div.get_text(strip=True)
+
+        # 提取选项和选中状态
+        options_wrapper = soup.find('div', class_='options-wrapper')
+        if not options_wrapper: return None
+        
+        options = {}
+        selected_options = []
+        
+        # ======================= 【核心修改点 1】 =======================
+        # 不再硬编码class名，而是查找所有带class属性的li标签，使其更通用
+        option_lis = options_wrapper.find_all('li', class_=True)
+
+        for li in option_lis:
+            # 提取选项字母和文本
+            text = li.get_text(strip=True)
+            match = re.match(r'([A-D])\.(.*)', text)
+            if match:
+                option_letter = match.group(1)
+                
+                # ======================= 【核心修改点 2】 =======================
+                # 为图片选项提供一个占位符，而不是空字符串
+                option_text = match.group(2).strip()
+                if not option_text and li.find('img'):
+                    option_text = "[图片选项]"
+                options[option_letter] = option_text
+                
+                # ======================= 【核心修改点 3】 =======================
+                # 通用化“选中状态”的判断
+                classes = li.get('class', [])
+                if any('active' in c for c in classes):
+                    selected_options.append(option_letter)
+        
+        if q_num and q_text and options:
+            return {
+                "q_num": q_num,
+                "q_type": q_type,
+                "q_text": q_text,
+                "options": options,
+                "selected_options": sorted(selected_options)
+            }
+    except Exception as e:
+        logger.error(f"解析HTML时发生错误: {e}")
+    return None
+
+def _parse_text_data(clipboard_text):
+    """原有的纯文本解析逻辑，作为备用方案。"""
+    lines = [line.strip() for line in clipboard_text.split('\n') if line.strip()]
+    q_info = {"options": {}}
+    question_text_lines = []
+    is_question_line = False
+    for line in lines:
+        match_q_num = re.search(r'^(第\d+题)\s*(单选|多选)', line)
+        if match_q_num:
+            q_info['q_num'] = match_q_num.group(1)
+            q_info['q_type'] = f"{match_q_num.group(2)}题"
+            is_question_line = True
+            continue
+        match_option = re.search(r'^([A-D])\.(.*)', line)
+        if match_option:
+            is_question_line = False
+            q_info['options'][match_option.group(1)] = match_option.group(2).strip()
+            continue
+        if is_question_line:
+            question_text_lines.append(line)
+    if question_text_lines:
+        q_info['q_text'] = " ".join(question_text_lines)
+    
+    if 'q_text' in q_info and 'q_num' in q_info and q_info['options']:
+        q_info['selected_options'] = []  # 纯文本模式无法获知选中状态
+        return q_info
+    return None
+
+def get_clipboard_data_robust():
+    """
+    健壮的剪贴板数据获取函数。
+    优先使用HTML格式获取题目内容和选中状态。
+    如果失败，则回退到纯文本格式。
+    """
     logger.info("正在通过剪贴板获取题目信息...")
     pyautogui.hotkey('ctrl', 'a'); time.sleep(0.1)
     pyautogui.hotkey('ctrl', 'c'); time.sleep(0.2)
+    
+    # 优先尝试HTML解析
+    html_content = _get_html_from_clipboard()
+    if html_content:
+        parsed_data = _parse_html_data(html_content)
+        if parsed_data:
+            logger.info(f"✅ [HTML解析成功] 题目: {parsed_data['q_num']}, 已选: {parsed_data['selected_options'] or '无'}")
+            return parsed_data
+
+    # HTML失败，回退到纯文本解析
+    logger.warning("HTML解析失败或不可用，回退到纯文本解析...")
     try:
         clipboard_text = pyperclip.paste()
         if not clipboard_text:
-            logger.warning("剪贴板为空，可能未能成功复制内容。")
+            logger.warning("剪贴板为空。")
             return None
-        lines = [line.strip() for line in clipboard_text.split('\n') if line.strip()]
-        q_info = {"options": {}}
-        question_text_lines = []
-        is_question_line = False
-        for line in lines:
-            match_q_num = re.search(r'^(第\d+题)\s*(单选|多选)', line)
-            if match_q_num:
-                q_info['q_num'] = match_q_num.group(1)
-                q_info['q_type'] = f"{match_q_num.group(2)}题"
-                is_question_line = True
-                continue
-            match_option = re.search(r'^([A-D])\.(.*)', line)
-            if match_option:
-                is_question_line = False
-                q_info['options'][match_option.group(1)] = match_option.group(2).strip()
-                continue
-            if is_question_line:
-                question_text_lines.append(line)
-        if question_text_lines:
-            q_info['q_text'] = " ".join(question_text_lines)
+        
+        parsed_data = _parse_text_data(clipboard_text)
+        if parsed_data:
+            logger.info(f"✅ [纯文本解析成功] 题目: {parsed_data['q_num']}")
+            return parsed_data
         else:
-            logger.error("解析剪贴板内容失败：未能找到题目文本。")
-            return None
-        if 'q_text' in q_info and 'q_num' in q_info and q_info['options']:
-            logger.info(f"题目解析成功: {q_info['q_num']} - {q_info['q_text'][:30]}...")
-            return q_info
-        else:
-            logger.error(f"解析剪贴板内容不完整。解析结果: {q_info}")
+            logger.error(f"纯文本解析不完整。")
             return None
     except Exception as e:
-        logger.error(f"从剪贴板获取或解析信息时发生错误: {e}")
+        logger.error(f"从剪贴板获取或解析纯文本时出错: {e}")
         return None
+
+# --- 逻辑函数 ---
 def find_submit_button_with_scroll(q_num, screenshot_dir):
     safe_q_num = re.sub(r'[\\/*?:"<>|]', "_", q_num) if q_num else "unknown_q"
     screenshot_path_1 = os.path.join(screenshot_dir, f"{safe_q_num}_1.png")
@@ -195,11 +313,12 @@ def find_submit_button_with_scroll(q_num, screenshot_dir):
         screen_img = capture_region()
         submit_pos = TEMPLATE_SUBMIT.match_in(screen_img)
         if submit_pos:
-            screenshot_path_2 = os.path.join(screenshot_dir, f"{safe_q_num}_2.png")
+            screenshot_path_2 = os.path.join(screenshot_dir, f"{safe_q_num}_2_scrolled.png")
             cv2.imwrite(screenshot_path_2, screen_img)
             logger.info(f"已保存滚动后的截图: {screenshot_path_2}")
             return submit_pos, True
     logger.warning(f"滚动后仍未找到[提交按钮]！"); return None, True
+
 def find_available_options():
     available = {}; screen_img = capture_region()
     for name, template_list in sorted(TEMPLATE_OPTIONS.items()):
@@ -208,6 +327,7 @@ def find_available_options():
             if pos: available[name] = pos; break
     if not available: logger.warning("在当前屏幕上未找到任何选项 (A, B, C, D)。")
     return available
+
 def validate_all_options_visible():
     logger.info("="*20 + " 开始初始环境校验 " + "="*20)
     logger.info("脚本将在3秒后进行屏幕选项校验...")
@@ -227,6 +347,7 @@ def validate_all_options_visible():
         missing_options = expected_options - found_options
         logger.critical(f"❌ [校验失败] 未能匹配到所有必需的选项模板！缺失的选项: {sorted(list(missing_options))}")
         return False
+
 def initialize_and_activate():
     logger.info("正在进行初始化操作：激活窗口...")
     submit_pos, _ = find_submit_button_with_scroll("initial_check", SCREENSHOT_RUN_DIR)
@@ -239,7 +360,6 @@ def initialize_and_activate():
         logger.error("初始化失败：未能找到[提交按钮]来激活窗口。")
         return False
 
-# ============================ 【新增】题库加载函数 ============================
 def load_qa_bank():
     """在脚本启动时加载主答题库文件。"""
     global qa_bank
@@ -259,116 +379,12 @@ def load_qa_bank():
         logger.warning(f"⚠️ 题库文件 '{QA_BANK_FILE}' 不存在，将仅使用遍历模式答题。")
         qa_bank = {}
 
-# ============================ 解答函数 (新增题库模式) ============================
-def solve_with_qa_bank(q_info, options_pos, submit_pos):
-    """
-    【新增】使用已加载的题库尝试解答。
-    如果成功，返回正确答案列表。
-    如果失败，返回 'FALLBACK'，通知主循环使用遍历模式。
-    """
-    q_text = q_info['q_text']
-    
-    # 1. 检查题库中是否存在该题目
-    if q_text not in qa_bank or not qa_bank[q_text]:
-        logger.info(f"题库中未找到题目: '{q_text[:30]}...' 或答案为空。")
-        return 'FALLBACK' # 返回特殊信号，表示需要回退到遍历模式
-
-    correct_answer_texts = qa_bank[q_text]
-    logger.info(f"✅ 在题库中找到题目，预设答案: {correct_answer_texts}")
-
-    # 2. 反向映射：根据答案文本找到对应的选项字母
-    options_text_to_letter = {v: k for k, v in q_info['options'].items()}
-    letters_to_click = []
-    for answer_text in correct_answer_texts:
-        if answer_text in options_text_to_letter:
-            letters_to_click.append(options_text_to_letter[answer_text])
-        else:
-            logger.warning(f"题库答案 '{answer_text}' 在当前选项中未找到，可能选项已变更。")
-            return 'FALLBACK'
-    
-    if not letters_to_click:
-        logger.error("根据题库答案未能匹配到任何可点击的选项。")
-        return 'FALLBACK'
-        
-    # 3. 尝试使用题库答案点击并提交（最多两次）
-    for attempt in range(1, 3): # 尝试2次
-        logger.info(f"--- [题库模式] 第 {attempt}/2 次尝试，点击选项: {letters_to_click} ---")
-        
-        # 点击所有正确选项
-        for letter in letters_to_click:
-            click_at_region_pos(options_pos[letter])
-            time.sleep(POST_TOUCH_DELAY)
-        
-        # 提交
-        click_at_region_pos(submit_pos)
-
-        # 检查题目是否刷新
-        if wait_for_next_question(q_text):
-            logger.info(f"🎉 [题库模式] 解答成功！正确答案: {correct_answer_texts}")
-            return correct_answer_texts # 成功，返回答案列表
-        else:
-            logger.warning(f"[题库模式] 第 {attempt} 次尝试失败，题目未刷新。")
-            # 如果是多选题，需要取消刚才的选择，以便下一次尝试或回退
-            if len(letters_to_click) > 1 or attempt == 1: # 单选第一次尝试后也取消
-                for letter in letters_to_click:
-                    click_at_region_pos(options_pos[letter])
-                    time.sleep(POST_TOUCH_DELAY)
-
-    logger.error(f"[题库模式] 两次尝试后依然失败。将回退到遍历模式进行解答。")
-    return 'FALLBACK' # 两次都失败，返回回退信号
-
-# (solve_single_choice, solve_multiple_choice, wait_for_next_question, write_solution_map_to_file 均无需修改)
-def solve_single_choice(q_info, options_pos, submit_pos):
-    logger.info(f"--- [遍历模式] 开始解答单选题: {q_info['q_text']} ---")
-    for attempt in range(1, MAX_SINGLE_CHOICE_ATTEMPTS + 1):
-        logger.info(f"--- 开始第 {attempt}/{MAX_SINGLE_CHOICE_ATTEMPTS} 轮单选题尝试 ---")
-        for option_name in sorted(options_pos.keys()):
-            logger.info(f"尝试单选项 [{option_name}]...")
-            click_at_region_pos(options_pos[option_name]); time.sleep(POST_TOUCH_DELAY)
-            click_at_region_pos(submit_pos)
-            if wait_for_next_question(q_info['q_text']):
-                correct_answer_text = q_info['options'][option_name]
-                logger.info(f"🎉 [遍历模式] 单选题 [{q_info['q_num']}] 的正确答案是: [{correct_answer_text}]")
-                return [correct_answer_text]
-            else:
-                logger.info(f"选项 [{option_name}] 错误，继续...")
-        logger.warning(f"第 {attempt} 轮尝试完成，题目仍未改变。")
-    logger.error(f"单选题 {q_info['q_text']} 在 {MAX_SINGLE_CHOICE_ATTEMPTS} 轮尝试后仍未解决。")
-    return None
-def solve_multiple_choice(q_info, options_pos, submit_pos):
-    logger.info(f"--- [遍历模式] 开始解答多选题: {q_info['q_text']} ---")
-    option_letters = sorted(options_pos.keys())
-    for attempt in range(1, MAX_MULTI_CHOICE_ATTEMPTS + 1):
-        logger.info(f"--- 开始第 {attempt}/{MAX_MULTI_CHOICE_ATTEMPTS} 轮多选题尝试 ---")
-        last_combo = set()
-        start_size = 2 if len(option_letters) > 1 else 1
-        for i in range(start_size, len(option_letters) + 1):
-            for combo in combinations(option_letters, i):
-                current_combo = set(combo)
-                logger.info(f"尝试多选组合: {list(current_combo)}")
-                options_to_unselect = last_combo - current_combo
-                options_to_select = current_combo - last_combo
-                for opt in options_to_unselect: click_at_region_pos(options_pos[opt]); time.sleep(POST_TOUCH_DELAY)
-                for opt in options_to_select: click_at_region_pos(options_pos[opt]); time.sleep(POST_TOUCH_DELAY)
-                click_at_region_pos(submit_pos)
-                if wait_for_next_question(q_info['q_text']):
-                    correct_combo_letters = sorted(list(current_combo))
-                    correct_answer_texts = [q_info['options'][letter] for letter in correct_combo_letters]
-                    logger.info(f"🎉 [遍历模式] 多选题 [{q_info['q_num']}] 的正确答案是: {correct_answer_texts}")
-                    return correct_answer_texts
-                else:
-                    logger.info(f"组合 {list(current_combo)} 错误，继续...")
-                    last_combo = current_combo
-        logger.warning(f"第 {attempt} 轮所有组合尝试完成，题目仍未改变。")
-        if last_combo:
-            for opt in last_combo: click_at_region_pos(options_pos[opt]); time.sleep(POST_TOUCH_DELAY)
-    logger.error(f"多选题 {q_info['q_text']} 在 {MAX_MULTI_CHOICE_ATTEMPTS} 轮尝试后仍未解决。")
-    return None
 def wait_for_next_question(current_q_text):
     logger.info(f"等待 {FIXED_POST_SUBMIT_DELAY} 秒后检查题目是否刷新...")
     time.sleep(FIXED_POST_SUBMIT_DELAY)
-    new_q_info = get_question_from_clipboard()
+    new_q_info = get_clipboard_data_robust()
     return new_q_info and new_q_info.get('q_text') != current_q_text
+
 def write_solution_map_to_file():
     if not solved_questions:
         logger.info("没有成功解答任何题目，无需生成答案映射文件。")
@@ -382,13 +398,130 @@ def write_solution_map_to_file():
     except Exception as e:
         logger.error(f"写入答案映射文件失败: {e}")
 
-# ============================ 主循环 (已升级为混合模式) ============================
+# ============================ 【核心升级】带验证的解答函数 ============================
+
+def verify_and_click(options_to_select, options_pos, max_retries=2):
+    """
+    点击、验证、再点击的核心函数。
+    :param options_to_select: 期望被选中的选项列表，例如 ['A', 'C']
+    :param options_pos: 各选项的屏幕坐标
+    :param max_retries: 最大重试次数
+    :return: True如果验证成功，False如果失败
+    """
+    if not IS_WINDOWS: # 如果不支持HTML验证，直接点击并返回成功
+        for opt in options_to_select:
+            click_at_region_pos(options_pos[opt]); time.sleep(POST_TOUCH_DELAY)
+        return True
+
+    expected_selection = set(options_to_select)
+    
+    for attempt in range(max_retries):
+        logger.info(f"  -> 第 {attempt+1}/{max_retries} 次尝试点击并验证: {options_to_select}")
+        # 点击所有期望的选项 (这种方式对于多选更安全，每次都重置状态)
+        # 1. 先获取当前状态
+        current_data = get_clipboard_data_robust()
+        current_selection = set(current_data.get('selected_options', []))
+        
+        # 2. 计算需要点击和取消点击的选项
+        to_select = expected_selection - current_selection
+        to_deselect = current_selection - expected_selection
+        
+        for opt in to_deselect:
+            click_at_region_pos(options_pos[opt]); time.sleep(POST_TOUCH_DELAY)
+        for opt in to_select:
+            click_at_region_pos(options_pos[opt]); time.sleep(POST_TOUCH_DELAY)
+        
+        # 3. 验证结果
+        time.sleep(0.3) # 等待UI反应
+        verified_data = get_clipboard_data_robust()
+        if verified_data and set(verified_data.get('selected_options', [])) == expected_selection:
+            logger.info(f"  -> ✅ 验证成功，选项 {options_to_select} 已被选中。")
+            return True
+        else:
+            logger.warning(f"  -> ❌ 验证失败。期望选中: {sorted(list(expected_selection))}, 实际选中: {verified_data.get('selected_options', '未知')}")
+    
+    logger.error(f"  -> ❌ 经过 {max_retries} 次尝试后，仍无法正确选中选项 {options_to_select}。")
+    return False
+
+def solve_with_qa_bank(q_info, options_pos, submit_pos):
+    q_text = q_info['q_text']
+    
+    if q_text not in qa_bank or not qa_bank[q_text]:
+        logger.info(f"题库中未找到题目: '{q_text[:30]}...' 或答案为空。")
+        return 'FALLBACK'
+
+    correct_answer_texts = qa_bank[q_text]
+    logger.info(f"✅ 在题库中找到题目，预设答案: {correct_answer_texts}")
+
+    options_text_to_letter = {v: k for k, v in q_info['options'].items()}
+    letters_to_click = []
+    for answer_text in correct_answer_texts:
+        if answer_text in options_text_to_letter:
+            letters_to_click.append(options_text_to_letter[answer_text])
+        else:
+            logger.warning(f"题库答案 '{answer_text}' 在当前选项中未找到。")
+            return 'FALLBACK'
+    
+    if not letters_to_click:
+        logger.error("根据题库答案未能匹配到任何可点击的选项。")
+        return 'FALLBACK'
+        
+    logger.info(f"--- [题库模式] 尝试解答，点击选项: {letters_to_click} ---")
+    if verify_and_click(letters_to_click, options_pos):
+        click_at_region_pos(submit_pos)
+        if wait_for_next_question(q_text):
+            logger.info(f"🎉 [题库模式] 解答成功！")
+            return correct_answer_texts
+        else:
+            logger.warning(f"[题库模式] 提交后题目未刷新，可能答案有误。")
+
+    logger.error(f"[题库模式] 解答失败。将回退到遍历模式。")
+    return 'FALLBACK'
+
+def solve_single_choice(q_info, options_pos, submit_pos):
+    logger.info(f"--- [遍历模式] 开始解答单选题: {q_info['q_text']} ---")
+    for option_name in sorted(options_pos.keys()):
+        logger.info(f"尝试单选项 [{option_name}]...")
+        if verify_and_click([option_name], options_pos):
+            click_at_region_pos(submit_pos)
+            if wait_for_next_question(q_info['q_text']):
+                correct_answer_text = q_info['options'][option_name]
+                logger.info(f"🎉 [遍历模式] 单选题 [{q_info['q_num']}] 的正确答案是: [{correct_answer_text}]")
+                return [correct_answer_text]
+            else:
+                logger.info(f"选项 [{option_name}] 错误，继续...")
+    logger.error(f"单选题 {q_info['q_text']} 在所有尝试后仍未解决。")
+    return None
+
+def solve_multiple_choice(q_info, options_pos, submit_pos):
+    logger.info(f"--- [遍历模式] 开始解答多选题: {q_info['q_text']} ---")
+    option_letters = sorted(options_pos.keys())
+    start_size = 2 if len(option_letters) > 1 else 1
+    
+    for i in range(start_size, len(option_letters) + 1):
+        for combo in combinations(option_letters, i):
+            current_combo = list(combo)
+            logger.info(f"尝试多选组合: {current_combo}")
+            
+            if verify_and_click(current_combo, options_pos):
+                click_at_region_pos(submit_pos)
+                if wait_for_next_question(q_info['q_text']):
+                    correct_answer_texts = [q_info['options'][letter] for letter in current_combo]
+                    logger.info(f"🎉 [遍历模式] 多选题 [{q_info['q_num']}] 的正确答案是: {correct_answer_texts}")
+                    return correct_answer_texts
+                else:
+                    logger.info(f"组合 {current_combo} 错误，继续...")
+    
+    logger.error(f"多选题 {q_info['q_text']} 在所有组合尝试后仍未解决。")
+    return None
+
+# ============================ 主循环 ============================
 def main_loop():
     last_question_text = "初始化"
     
     while True:
         logger.info("\n" + "="*20 + " 新一轮检测循环 " + "="*20)
-        q_info = get_question_from_clipboard()
+        q_info = get_clipboard_data_robust()
         
         if not q_info or not q_info.get('q_text'):
             logger.error("无法获取或解析当前题目信息，脚本可能卡住或已结束。等待5秒后重试..."); time.sleep(5)
@@ -413,8 +546,6 @@ def main_loop():
                 logger.error(f"在题目 {q_info['q_num']} 找不到任何选项，脚本无法继续。"); break
             
             correct_answer = None
-            
-            # --- 混合答题策略 ---
             use_fallback = False
             if USE_QA_BANK:
                 bank_result = solve_with_qa_bank(q_info, options_pos, submit_pos)
@@ -423,37 +554,32 @@ def main_loop():
                 else:
                     correct_answer = bank_result
             
-            # 如果不使用题库，或者题库解答失败，则使用遍历模式
             if not USE_QA_BANK or use_fallback:
                 if q_info['q_type'] == "单选题":
                     correct_answer = solve_single_choice(q_info, options_pos, submit_pos)
-                else: # 多选题
+                else:
                     correct_answer = solve_multiple_choice(q_info, options_pos, submit_pos)
-            # --- 策略结束 ---
 
             if correct_answer:
                 solved_questions[current_q_text] = correct_answer
-                last_question_text = current_q_text
+                # 为了防止题目文本完全相同导致卡住，我们使用题号+文本作为唯一标识
+                last_question_text = current_q_text 
             else:
                 logger.critical(f"题目 {q_info['q_num']} 未能成功解答，脚本终止！"); break
         else:
-            logger.info(f"题目未变({q_info['q_num']})，等待2秒..."); time.sleep(2)
+            logger.info(f"题目未变({q_info.get('q_num', '未知')})，等待2秒..."); time.sleep(2)
 
 # ============================ 程序入口 ============================
 if __name__ == "__main__":
     try:
-        # 0. 加载主题库
         load_qa_bank()
 
-        # 1. 初始化操作，点击提交按钮以激活窗口
         if not initialize_and_activate():
             exit()
 
-        # 2. 校验屏幕环境，确保所有选项按钮模板都能被识别
         if not validate_all_options_visible():
             exit()
         
-        # 3. 开始正式的答题循环
         main_loop()
 
     except pyautogui.FailSafeException:
@@ -461,6 +587,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.exception("脚本运行过程中发生未处理的异常！")
     finally:
-        # 确保无论脚本如何退出，都会尝试写入已解答的题目
         write_solution_map_to_file()
         logger.info("脚本执行结束。")
