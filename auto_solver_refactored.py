@@ -55,7 +55,7 @@ if not logger.handlers:
 # ==============================================================================
 SCREEN_REGION = (2959, 0, 828, 2062)
 SCROLL_MODE = 'PC_WHEEL'
-FIXED_POST_SUBMIT_DELAY = 1
+FIXED_POST_SUBMIT_DELAY = 0.5
 POST_TOUCH_DELAY = 0.5  # 适当降低延时，因为有验证机制
 POST_SCROLL_DELAY = 1.5
 MAX_SINGLE_CHOICE_ATTEMPTS = 2
@@ -64,7 +64,7 @@ MAX_SCROLL_ATTEMPTS = 3
 STOP_AT_QUESTION_NUM = "第78题"
 
 # ============================ 题库配置 ============================
-USE_QA_BANK = True
+USE_QA_BANK = False
 QA_BANK_FILE = "master_qa_bank.json"
 
 # ===========================================================================
@@ -444,38 +444,60 @@ def verify_and_click(options_to_select, options_pos, max_retries=2):
     return False
 
 def solve_with_qa_bank(q_info, options_pos, submit_pos):
+    """
+    【升级版】使用已加载的新格式题库尝试解答。
+    它会先匹配问题文本，再匹配选项集。
+    """
     q_text = q_info['q_text']
     
-    if q_text not in qa_bank or not qa_bank[q_text]:
-        logger.info(f"题库中未找到题目: '{q_text[:30]}...' 或答案为空。")
+    # 1. 检查题库中是否存在该问题文本
+    if q_text not in qa_bank:
+        logger.info(f"题库中未找到题目: '{q_text[:30]}...'")
         return 'FALLBACK'
 
-    correct_answer_texts = qa_bank[q_text]
-    logger.info(f"✅ 在题库中找到题目，预设答案: {correct_answer_texts}")
+    # 2. 获取当前屏幕上的选项集合，用于匹配
+    # 使用 set 是为了无序比较
+    current_options_set = set(q_info['options'].values())
+    
+    # 3. 遍历该问题的所有已知变种 (variants)
+    for variant in qa_bank[q_text]:
+        known_options_set = set(variant['options'])
+        
+        # 4. 如果选项集合完全匹配
+        if current_options_set == known_options_set:
+            correct_answer_texts = variant['answer']
+            logger.info(f"✅ 在题库中找到题目和完全匹配的选项集，预设答案: {correct_answer_texts}")
 
-    options_text_to_letter = {v: k for k, v in q_info['options'].items()}
-    letters_to_click = []
-    for answer_text in correct_answer_texts:
-        if answer_text in options_text_to_letter:
-            letters_to_click.append(options_text_to_letter[answer_text])
-        else:
-            logger.warning(f"题库答案 '{answer_text}' 在当前选项中未找到。")
+            # --- 后续逻辑与之前类似，但使用匹配到的答案 ---
+            options_text_to_letter = {v: k for k, v in q_info['options'].items()}
+            letters_to_click = []
+            for answer_text in correct_answer_texts:
+                if answer_text in options_text_to_letter:
+                    letters_to_click.append(options_text_to_letter[answer_text])
+                else:
+                    # 这种情况理论上不应发生，因为我们已经确认了选项集匹配
+                    logger.error(f"严重错误：选项集匹配但答案文本 '{answer_text}' 找不到。")
+                    return 'FALLBACK' # 出现意外，回退
+            
+            if not letters_to_click:
+                logger.error("根据题库答案未能匹配到任何可点击的选项。")
+                return 'FALLBACK'
+
+            logger.info(f"--- [题库模式] 尝试解答，点击选项: {letters_to_click} ---")
+            if verify_and_click(letters_to_click, options_pos):
+                click_at_region_pos(submit_pos)
+                if wait_for_next_question(q_text):
+                    logger.info(f"🎉 [题库模式] 解答成功！")
+                    return correct_answer_texts # 返回正确答案
+                else:
+                    logger.warning(f"[题库模式] 提交后题目未刷新，题库答案可能已失效。")
+            
+            # 如果题库答案错误，则回退到遍历模式
+            logger.error(f"[题库模式] 解答失败。将回退到遍历模式。")
             return 'FALLBACK'
     
-    if not letters_to_click:
-        logger.error("根据题库答案未能匹配到任何可点击的选项。")
-        return 'FALLBACK'
-        
-    logger.info(f"--- [题库模式] 尝试解答，点击选项: {letters_to_click} ---")
-    if verify_and_click(letters_to_click, options_pos):
-        click_at_region_pos(submit_pos)
-        if wait_for_next_question(q_text):
-            logger.info(f"🎉 [题库模式] 解答成功！")
-            return correct_answer_texts
-        else:
-            logger.warning(f"[题库模式] 提交后题目未刷新，可能答案有误。")
-
-    logger.error(f"[题库模式] 解答失败。将回退到遍历模式。")
+    # 遍历完所有变种，没有找到匹配的选项集
+    logger.info(f"题库中虽有同名问题，但选项集不匹配。这是一个新变种。")
     return 'FALLBACK'
 
 def solve_single_choice(q_info, options_pos, submit_pos):
@@ -561,9 +583,36 @@ def main_loop():
                     correct_answer = solve_multiple_choice(q_info, options_pos, submit_pos)
 
             if correct_answer:
-                solved_questions[current_q_text] = correct_answer
-                # 为了防止题目文本完全相同导致卡住，我们使用题号+文本作为唯一标识
-                last_question_text = current_q_text 
+                # ------ 【核心修改】 ------
+                # 使用新的、更健壮的数据结构来记录答案
+                q_text = q_info['q_text']
+                # 获取当前这道题的所有选项文本，并排序以创建唯一标识
+                current_options_sorted = sorted(list(q_info['options'].values()))
+                
+                # 准备要存储的新条目
+                new_entry = {
+                    "options": current_options_sorted,
+                    "answer": correct_answer
+                }
+
+                # 检查此问题是否已在solved_questions中
+                if q_text not in solved_questions:
+                    solved_questions[q_text] = []
+
+                # 检查这个选项组合是否已经存在，存在则更新，不存在则添加
+                found = False
+                for i, existing_entry in enumerate(solved_questions[q_text]):
+                    if existing_entry["options"] == current_options_sorted:
+                        # 选项组合已存在，用新答案覆盖（通常不会发生在一轮运行中，但为保险起见）
+                        solved_questions[q_text][i] = new_entry
+                        found = True
+                        break
+                
+                if not found:
+                    solved_questions[q_text].append(new_entry)
+                # ------ 【修改结束】 ------
+
+                last_question_text = current_q_text
             else:
                 logger.critical(f"题目 {q_info['q_num']} 未能成功解答，脚本终止！"); break
         else:
