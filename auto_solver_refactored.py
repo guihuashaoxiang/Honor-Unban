@@ -161,7 +161,7 @@ POST_SCROLL_DELAY = 1.5
 # # 【已弃用】多选题遍历模式下的最大尝试次数。现在由逻辑自动决定。
 # MAX_MULTI_CHOICE_ATTEMPTS = 3
 # 当屏幕上找不到“提交”按钮时，尝试向下滚动的最大次数。
-MAX_SCROLL_ATTEMPTS = 3
+MAX_SCROLL_ATTEMPTS = 5
 # 当遇到指定题号时，脚本将自动停止。设置为空字符串 "" 可禁用此功能。例如: "第78题",未修复。
 STOP_AT_QUESTION_NUM = None
 
